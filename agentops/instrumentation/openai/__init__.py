@@ -93,6 +93,7 @@ def process_token_usage(usage: Dict[str, Any], attributes: Dict[str, Any]) -> No
         process_token_details(usage["output_tokens_details"], attributes)
 
 
+# QUESTION: What are the metrics and their scalability for the future?
 def process_token_details(details: Dict[str, Any], attributes: Dict[str, Any]) -> None:
     """
     Process detailed token metrics from OpenAI API responses and add them to span attributes.
