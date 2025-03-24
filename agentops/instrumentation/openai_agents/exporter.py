@@ -1,112 +1,18 @@
 """OpenAI Agents SDK Instrumentation Exporter for AgentOps
 
-SPAN LIFECYCLE MANAGEMENT:
-This implementation handles the span lifecycle across multiple callbacks with a precise approach:
+This module handles the conversion of Agents SDK spans to OpenTelemetry spans.
+It manages the complete span lifecycle, attribute application, and proper span hierarchy.
 
-1. Start Events:
-   - Create spans but DO NOT END them
-   - Store span references in tracking dictionaries
-   - Use OpenTelemetry's start_span (not context manager) to control when spans end
-   - Leave status as UNSET to indicate in-progress
-
-2. End Events:
-   - Look up existing span by ID in tracking dictionaries
-   - If found and not ended:
-     - Update span with all final attributes
-     - Set status to OK or ERROR based on task outcome
-     - End the span manually
-   - If not found or already ended:
-     - Create a new complete span with all data
-     - End it immediately
-
-3. Error Handling:
-   - Check if spans are already ended before attempting updates
-   - Provide informative log messages about span lifecycle
-   - Properly clean up tracking resources
-
-This approach is essential because:
-- Agents SDK sends separate start and end events for each task
-- We need to maintain a single span for the entire task lifecycle to get accurate timing
-- Final data (outputs, token usage, etc.) is only available at the end event
-- We want to avoid creating duplicate spans for the same task
-- Spans must be properly created and ended to avoid leaks
-
-The span lifecycle management ensures spans have:
-- Accurate start and end times (preserving the actual task duration)
-- Complete attribute data from both start and end events
-- Proper status reflecting task completion
-- All final outputs, errors, and metrics
-- Clean resource management with no memory leaks
-
-IMPORTANT SERIALIZATION RULES:
-1. We do not serialize data structures arbitrarily; everything has a semantic convention.
-2. Span attributes should use semantic conventions and avoid complex serialized structures.
-3. Keep all string data in its original form - do not parse JSON within strings.
-4. If a function has JSON attributes for its arguments, do not parse that JSON - keep as string.
-5. If a completion or response body text/content contains JSON, keep it as a string.
-6. When a semantic convention requires a value to be added to span attributes:
-   - DO NOT apply JSON serialization
-   - All attribute values should be strings or simple numeric/boolean values
-   - If we encounter JSON or an object in an area that expects a string, raise an exception
-7. Function arguments and tool call arguments should remain in their raw string form.
-
-CRITICAL: NEVER MANUALLY SET THE ROOT COMPLETION ATTRIBUTES
-- DO NOT set SpanAttributes.LLM_COMPLETIONS or "gen_ai.completion" manually
-- Let OpenTelemetry backend derive these values from the detailed attributes
-- Setting root completion attributes creates duplication and inconsistency
-
-STRUCTURED ATTRIBUTE HANDLING:
-- Always use MessageAttributes semantic conventions for content and tool calls
-- For chat completions, use MessageAttributes.COMPLETION_CONTENT.format(i=0) 
-- For tool calls, use MessageAttributes.TOOL_CALL_NAME.format(i=0, j=0), etc.
-- Never try to combine or aggregate contents into a single attribute
-- Each message component should have its own properly formatted attribute
-- This ensures proper display in OpenTelemetry backends and dashboards
+See the README.md in this directory for complete documentation on:
+- Span lifecycle management approach
+- Serialization rules for attributes
+- Structured attribute handling
+- Semantic conventions usage
 
 IMPORTANT FOR TESTING:
 - Tests should verify attribute existence using MessageAttributes constants
 - Do not check for the presence of SpanAttributes.LLM_COMPLETIONS
 - Verify individual content/tool attributes instead of root attributes
-
-WAYS TO USE SEMANTIC CONVENTIONS WHEN REFERENCING SPAN ATTRIBUTES:
-1. Always use the constant values from the semantic convention classes rather than hardcoded strings:
-   ```python
-   # Good
-   attributes[SpanAttributes.LLM_PROMPTS] = input_value
-   
-   # Avoid
-   attributes["gen_ai.prompt"] = input_value
-   ```
-
-2. For structured attributes like completions, use the format methods from MessageAttributes:
-   ```python
-   # Good
-   attributes[MessageAttributes.COMPLETION_CONTENT.format(i=0)] = content
-   
-   # Avoid
-   attributes["gen_ai.completion.0.content"] = content
-   ```
-
-3. Be consistent with naming patterns across different span types:
-   - Use `SpanAttributes.LLM_PROMPTS` for input/prompt data
-   - Use `MessageAttributes.COMPLETION_CONTENT.format(i=0)` for output/response content
-   - Use `WorkflowAttributes.FINAL_OUTPUT` for workflow outputs
-
-4. Keep special attributes at their correct levels:
-   - Don't manually set root completion attributes (`SpanAttributes.LLM_COMPLETIONS`) 
-   - Set MessageAttributes for each individual message component
-   - Let the OpenTelemetry backend derive the root attributes
-
-5. When searching for attributes in spans, use the constants from the semantic convention classes:
-   ```python
-   # Good
-   if SpanAttributes.LLM_PROMPTS in span.attributes:
-       # Do something
-   
-   # Avoid
-   if "gen_ai.prompt" in span.attributes:
-       # Do something
-   ```
 """
 import json
 from typing import Any, Dict, Optional
@@ -119,20 +25,13 @@ from opentelemetry.sdk.trace import Span
 from agentops.logging import logger
 from agentops.semconv import (
     CoreAttributes, 
-    WorkflowAttributes,
-    SpanAttributes,
 )
 from agentops.instrumentation.openai_agents import LIBRARY_NAME, LIBRARY_VERSION
 from agentops.instrumentation.openai_agents.attributes.common import (
-    get_span_kind,
     get_base_trace_attributes,
     get_base_span_attributes,
     get_span_attributes,
-    get_agent_span_attributes,
-    get_generation_span_attributes,
 )
-
-TRACE_PREFIX = "agents.trace"
 
 
 def log_otel_trace_id(span_type):
@@ -163,6 +62,30 @@ def log_otel_trace_id(span_type):
     
     logger.debug(f"[SPAN] Export | Type: {span_type} | NO TRACE ID AVAILABLE")
     return None
+
+
+def get_span_kind(span: Any) -> SpanKind:
+    """Determine the appropriate span kind based on span type."""
+    span_data = span.span_data
+    span_type = span_data.__class__.__name__
+    
+    if span_type == "AgentSpanData":
+        return SpanKind.CONSUMER
+    elif span_type in ["FunctionSpanData", "GenerationSpanData", "ResponseSpanData"]:
+        return SpanKind.CLIENT
+    else:
+        return SpanKind.INTERNAL
+
+
+def get_span_name(span: Any) -> str:
+    """Get the name of the span based on its type and attributes."""
+    span_data = span.span_data
+    span_type = span_data.__class__.__name__
+    
+    if hasattr(span_data, "name") and span_data.name:
+        return span_data.name
+    else:
+        return span_type.replace('SpanData', '').lower()  # fallback
 
 
 def _get_span_lookup_key(trace_id: str, span_id: str) -> str:
@@ -247,7 +170,7 @@ class OpenAIAgentsExporter:
         
         # Create span directly instead of using context manager
         span = tracer.start_span(
-            name=f"{TRACE_PREFIX}.{trace.name}",
+            name=trace.name,
             kind=SpanKind.INTERNAL,
             attributes=attributes
         )
@@ -402,7 +325,7 @@ class OpenAIAgentsExporter:
         if not is_end_event:
             # Process the span based on its type
             # TODO span_name should come from the attributes module
-            span_name = f"agents.{span_type.replace('SpanData', '').lower()}"
+            span_name = get_span_name(span)
             span_kind = get_span_kind(span)
             
             # Get parent context for proper nesting
